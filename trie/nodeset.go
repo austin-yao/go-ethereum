@@ -21,6 +21,9 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"unsafe"
+	"os"
+	"encoding/json"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -94,10 +97,18 @@ func (n *nodeWithPrev) memorySize(pathlen int) int {
 // Each node is keyed by path. It's not thread-safe to use.
 type NodeSet struct {
 	owner   common.Hash            // the identifier of the trie
+	// nodes is a mapping to a memoryNode
+	// what does the string represent? just a path?
+	// we need to keep track of the path, it is important
 	nodes   map[string]*memoryNode // the set of dirty nodes(inserted, updated, deleted)
 	leaves  []*leaf                // the list of dirty leaves
 	updates int                    // the count of updated and inserted nodes
 	deletes int                    // the count of deleted nodes
+
+	// my new thing
+	totalSize int
+	touched map[string]bool
+	sizes map[string]int
 
 	// The list of accessed nodes, which records the original node value.
 	// The origin value is expected to be nil for newly inserted node
@@ -113,6 +124,8 @@ func NewNodeSet(owner common.Hash, accessList map[string][]byte) *NodeSet {
 		owner:      owner,
 		nodes:      make(map[string]*memoryNode),
 		accessList: accessList,
+		touched: make(map[string]bool),
+		sizes: make(map[string]int),
 	}
 }
 
@@ -131,15 +144,55 @@ func (set *NodeSet) forEachWithOrder(callback func(path string, n *memoryNode)) 
 }
 
 // markUpdated marks the node as dirty(newly-inserted or updated).
+// a lot of the updating in this function is no longer necessary,
+// since we only need to keep track of the touched nodes now.
+// keeping just in case we need to revert
 func (set *NodeSet) markUpdated(path []byte, node *memoryNode) {
 	set.nodes[string(path)] = node
 	set.updates += 1
+	
+	if set.touched[string(path)] == false {
+		f, err := os.OpenFile("data/nodes.txt", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+
+		jsonData, err := json.Marshal(node.hash)
+		if err != nil {
+			fmt.Println(err)
+		} else {
+			f.WriteString(string(jsonData) + "\n")
+		}
+
+		set.totalSize += int(unsafe.Sizeof(*node))
+		set.touched[string(path)] = true
+		set.sizes[string(path)] = int(unsafe.Sizeof(*node))
+	} else {
+		// updating the totalSize to be the most recent
+		set.totalSize -= set.sizes[string(path)]
+		set.sizes[string(path)] = int(unsafe.Sizeof(*node))
+		set.totalSize += int(unsafe.Sizeof(node))
+	}
 }
 
 // markDeleted marks the node as deleted.
 func (set *NodeSet) markDeleted(path []byte) {
+	// this is the node that was deleted
+	// node := set.nodes[string(path)]
 	set.nodes[string(path)] = &memoryNode{}
 	set.deletes += 1
+
+	if set.touched[string(path)] == false {
+		// these are just empty nodes
+		set.totalSize += int(unsafe.Sizeof(memoryNode{}))
+		set.touched[string(path)] = true
+		set.sizes[string(path)] = int(unsafe.Sizeof(memoryNode{}))
+	} else {
+		set.totalSize -= set.sizes[string(path)]
+		set.sizes[string(path)] = int(unsafe.Sizeof(memoryNode{}))
+		set.totalSize += int(unsafe.Sizeof(memoryNode{}))
+	}
 }
 
 // addLeaf collects the provided leaf node into set.
@@ -150,6 +203,15 @@ func (set *NodeSet) addLeaf(node *leaf) {
 // Size returns the number of dirty nodes in set.
 func (set *NodeSet) Size() (int, int) {
 	return set.updates, set.deletes
+}
+
+// also my function
+func (set *NodeSet) TotalSize() (int) {
+	set.touched = make(map[string]bool)
+	set.sizes = make(map[string]int)
+	ans := set.totalSize
+	set.totalSize = 0
+	return ans;
 }
 
 // Hashes returns the hashes of all updated nodes. TODO(rjl493456442) how can
@@ -208,6 +270,7 @@ func NewWithNodeSet(set *NodeSet) *MergedNodeSet {
 
 // Merge merges the provided dirty nodes of a trie into the set. The assumption
 // is held that no duplicated set belonging to the same trie will be merged twice.
+// isn't actually owning, just changing the parent pointer?
 func (set *MergedNodeSet) Merge(other *NodeSet) error {
 	_, present := set.sets[other.owner]
 	if present {
@@ -216,3 +279,106 @@ func (set *MergedNodeSet) Merge(other *NodeSet) error {
 	set.sets[other.owner] = other
 	return nil
 }
+// <------ MY FUNCTIONS ----->
+
+// gets the size of all the nodes
+func (set *MergedNodeSet) Size() (int, int) {
+	var updates = 0
+	var deleted = 0
+	for _, other_set := range set.sets {
+		numUpdated, numDeleted := other_set.Size()
+		updates += numUpdated
+		deleted += numDeleted
+	}
+
+	return updates, deleted
+}
+
+func (set *MergedNodeSet) TotalSize() (int) {
+	var totalSize = 0
+	for _, other_set := range set.sets {
+		// totalSize changes each time (will get erased)
+		// will only record the size of the most recent block
+		// we need something global
+		sizeToAdd := other_set.TotalSize()
+		totalSize += sizeToAdd
+	}
+
+	return totalSize
+}
+
+// idea: any state that is touched will have to be submitted back onto chain
+// could we optimize by only submitting nodes that have a different state than original? would need to store a copy of the original state 
+// and then iterate through all dirty nodes and compare.....
+// possible, but we should ask
+
+// ALSO: Super inefficient. O(n) time for each operation vs O(1)
+// IDK how else you would merge two sets.
+
+// we need to iterate through all the touched nodes in each nodeSet for this block. 
+
+
+// Adds the size of newly dirty nodes to our totalSize
+
+func (set *MergedNodeSet) Combine(otherMerged *MergedNodeSet, nodeSizes map[string]int, cumSize int) (error, int) {
+	// var size = 0
+	for _, other := range otherMerged.sets {
+		// checking each nodeSet in otherMerged.sets
+		// lets iterate through each touched node. this will get slow!!
+		for path, _ := range other.touched {
+			value, exists := nodeSizes[path]
+			if exists {
+				cumSize -= value
+				currNode := other.nodes[path]
+				cumSize += int(unsafe.Sizeof(*currNode))
+				nodeSizes[path] = int(unsafe.Sizeof(*currNode))
+			} else {
+				currNode := other.nodes[path]
+				cumSize += int(unsafe.Sizeof(*currNode))
+				nodeSizes[path] = int(unsafe.Sizeof(*currNode))
+			}
+		}
+	}
+	return nil, cumSize
+}
+
+// counts the number of distinct nodes. not used, only for testing
+
+func (set *MergedNodeSet) countNodes(otherMerged *MergedNodeSet, nodeSizes map[string]int, cumSize int) (error, int) {
+	var size = 0
+	for _, other := range otherMerged.sets {
+		_, present := set.sets[other.owner]
+		if present == false {
+			set.sets[other.owner] = other
+			size += int(unsafe.Sizeof(other))
+		} else {
+			for path, node := range other.nodes {
+				if exists := set.sets[other.owner].nodes[path]; exists == nil {
+					set.sets[other.owner].nodes[path] = node
+					size += int(unsafe.Sizeof(node))
+				}
+			}
+		}
+	}
+	return nil, size
+}
+
+
+/*
+func (set *MergedNodeSet) CombineWithOptimization(other *nodeSet, copy *nodeSet) {
+	_, present := set.sets[other.owner]
+	if present == nil {
+		set.sets[other.owner] = other
+		return
+	}
+
+	for path, node := range other.nodes {
+		if exists := set.sets[other.owner].nodes[path]; exists == nil {
+			set.sets[other.owner].nodes[path] = node;
+		}
+		if node == copy.nodes[path] {
+			set.sets[other.owner].nodes[path] = nil;
+		}
+	}
+}
+*/

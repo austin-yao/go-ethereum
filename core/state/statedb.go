@@ -23,6 +23,8 @@ import (
 	"math/big"
 	"sort"
 	"time"
+	"os"
+	"encoding/csv"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -48,6 +50,7 @@ func (n *proofList) Put(key []byte, value []byte) error {
 	return nil
 }
 
+// lol
 func (n *proofList) Delete(key []byte) error {
 	panic("not supported")
 }
@@ -74,7 +77,11 @@ type StateDB struct {
 
 	// This map holds 'live' objects, which will get modified while processing a state transition.
 	stateObjects         map[common.Address]*stateObject
+
+	// maps from an address to some kind of struct
 	stateObjectsPending  map[common.Address]struct{} // State objects finalized but not yet written to the trie
+
+	// IMPORANT
 	stateObjectsDirty    map[common.Address]struct{} // State objects modified in the current execution
 	stateObjectsDestruct map[common.Address]struct{} // State objects destructed in the block
 
@@ -195,6 +202,7 @@ func (s *StateDB) Error() error {
 }
 
 func (s *StateDB) AddLog(log *types.Log) {
+	// what does the journal do?
 	s.journal.append(addLogChange{txhash: s.thash})
 
 	log.TxHash = s.thash
@@ -956,8 +964,32 @@ func (s *StateDB) clearJournalAndRefund() {
 	s.validRevisions = s.validRevisions[:0] // Snapshots can be created without journal entries
 }
 
-// Commit writes the state to the underlying in-memory trie database.
+// We don't need to store the globalNodes anymore, but it makes the abstraction of functions easier
+// since we can add to functions in the nodeset.go file
+var globalNodes = trie.NewMergedNodeSet()
+
+// the cumulative size of the state changes 
+// we keep track of this in between publishing to the L1
+var globalSize = 0
+// number of commits/blocks
+var counter = 0
+// number of blocks after which we reset
+var BLOCK_DELTA = 10
+
+var flag = true;
+
+// maps the memory address of a node to its size. we use this to keep track of which nodes
+// have been accounted for in between publishing to the L1
+var nodeSizes = make(map[string]int)
+
 func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
+	f, err := os.OpenFile("data/csv-data.csv", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	var writer *csv.Writer
 	// Short circuit in case any database failure occurred earlier.
 	if s.dbErr != nil {
 		return common.Hash{}, fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
@@ -982,6 +1014,8 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 				obj.dirtyCode = false
 			}
 			// Write any storage changes in the state object to its storage trie
+			// TODO: do we just care about the length? or what exactly we are commiting?
+			// we want the size of the nodes. these are the ones of each trie that get committed
 			set, err := obj.commitTrie(s.db)
 			if err != nil {
 				return common.Hash{}, err
@@ -991,6 +1025,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 				if err := nodes.Merge(set); err != nil {
 					return common.Hash{}, err
 				}
+				// TODO: With the optimization, the size of this set is not necessarily the size that we need...
 				updates, deleted := set.Size()
 				storageTrieNodesUpdated += updates
 				storageTrieNodesDeleted += deleted
@@ -1022,6 +1057,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 		if err := nodes.Merge(set); err != nil {
 			return common.Hash{}, err
 		}
+		// TODO: can we use this size???
 		accountTrieNodesUpdated, accountTrieNodesDeleted = set.Size()
 	}
 	if metrics.EnabledExpensive {
@@ -1071,6 +1107,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 	}
 	if root != origin {
 		start := time.Now()
+		// TODO: Where nodes shows up again, we update it in the trie database.
 		if err := s.db.TrieDB().Update(nodes); err != nil {
 			return common.Hash{}, err
 		}
@@ -1078,6 +1115,46 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 		if metrics.EnabledExpensive {
 			s.TrieDBCommits += time.Since(start)
 		}
+	}
+	
+	// checks all the dirty nodes in this block and updates our globalSize
+	err, size := globalNodes.Combine(nodes, nodeSizes, globalSize)
+	
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	// we udpate globalSize based on the new cumulativeSize after combining above
+	globalSize = size;
+	counter = counter + 1
+
+	if counter == BLOCK_DELTA {
+		counter = 0;
+		
+		// get the size
+		// globalUpdates, globalDeletes := globalNodes.Size()
+		
+		// totalSize := globalUpdates + globalDeletes
+		// totalSize := globalNodes.TotalSize();
+		if writer == nil {
+			writer = csv.NewWriter(f)
+		}
+		if flag == true {
+			flag = false
+			err2 := writer.Write([]string{"State Diffs"})
+			if err2 != nil {
+				panic(err)
+			}
+		}
+		err = writer.Write([]string{fmt.Sprintf("%d", globalSize)})
+		if err != nil {
+			panic(err)
+		}
+		writer.Flush()
+		// resetting everything
+		globalNodes = trie.NewMergedNodeSet()
+		globalSize = 0
+		nodeSizes = make(map[string]int)
 	}
 	return root, nil
 }
