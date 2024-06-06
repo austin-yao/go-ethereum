@@ -1014,7 +1014,6 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 				obj.dirtyCode = false
 			}
 			// Write any storage changes in the state object to its storage trie
-			// TODO: do we just care about the length? or what exactly we are commiting?
 			// we want the size of the nodes. these are the ones of each trie that get committed
 			set, err := obj.commitTrie(s.db)
 			if err != nil {
