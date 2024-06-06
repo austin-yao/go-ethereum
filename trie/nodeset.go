@@ -205,7 +205,7 @@ func (set *NodeSet) Size() (int, int) {
 	return set.updates, set.deletes
 }
 
-// also my function
+// new function
 func (set *NodeSet) TotalSize() (int) {
 	set.touched = make(map[string]bool)
 	set.sizes = make(map[string]int)
@@ -270,7 +270,7 @@ func NewWithNodeSet(set *NodeSet) *MergedNodeSet {
 
 // Merge merges the provided dirty nodes of a trie into the set. The assumption
 // is held that no duplicated set belonging to the same trie will be merged twice.
-// isn't actually owning, just changing the parent pointer?
+// isn't actually owning, just changing the parent pointer.
 func (set *MergedNodeSet) Merge(other *NodeSet) error {
 	_, present := set.sets[other.owner]
 	if present {
@@ -307,19 +307,7 @@ func (set *MergedNodeSet) TotalSize() (int) {
 	return totalSize
 }
 
-// idea: any state that is touched will have to be submitted back onto chain
-// could we optimize by only submitting nodes that have a different state than original? would need to store a copy of the original state 
-// and then iterate through all dirty nodes and compare.....
-// possible, but we should ask
-
-// ALSO: Super inefficient. O(n) time for each operation vs O(1)
-// IDK how else you would merge two sets.
-
-// we need to iterate through all the touched nodes in each nodeSet for this block. 
-
-
-// Adds the size of newly dirty nodes to our totalSize
-
+// Adds the size of newly dirty nodes to our totalSize by iterating through touched nodes.
 func (set *MergedNodeSet) Combine(otherMerged *MergedNodeSet, nodeSizes map[string]int, cumSize int) (error, int) {
 	// var size = 0
 	for _, other := range otherMerged.sets {
@@ -343,7 +331,6 @@ func (set *MergedNodeSet) Combine(otherMerged *MergedNodeSet, nodeSizes map[stri
 }
 
 // counts the number of distinct nodes. not used, only for testing
-
 func (set *MergedNodeSet) countNodes(otherMerged *MergedNodeSet, nodeSizes map[string]int, cumSize int) (error, int) {
 	var size = 0
 	for _, other := range otherMerged.sets {
@@ -362,23 +349,3 @@ func (set *MergedNodeSet) countNodes(otherMerged *MergedNodeSet, nodeSizes map[s
 	}
 	return nil, size
 }
-
-
-/*
-func (set *MergedNodeSet) CombineWithOptimization(other *nodeSet, copy *nodeSet) {
-	_, present := set.sets[other.owner]
-	if present == nil {
-		set.sets[other.owner] = other
-		return
-	}
-
-	for path, node := range other.nodes {
-		if exists := set.sets[other.owner].nodes[path]; exists == nil {
-			set.sets[other.owner].nodes[path] = node;
-		}
-		if node == copy.nodes[path] {
-			set.sets[other.owner].nodes[path] = nil;
-		}
-	}
-}
-*/
